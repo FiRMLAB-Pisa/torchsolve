@@ -69,6 +69,28 @@ reach zero. What genuinely needs more than this is a non-smooth penalty or a
 constraint coupling many parameters at once -- and that is what the solver seam
 is for, rather than something this package should grow.
 
+## Batched fits, and the GPU
+
+`LstsqSolver` sends a host-resident batch to the GPU when there is one and the
+batch is worth the transfer, and brings the answer back. Only the raw Jacobian
+crosses: the stacked system is assembled on the device, so the enlarged matrix
+is never held on the host.
+
+200k independent 32x4 problems, one RTX 4060 Laptop GPU:
+
+| | |
+|---|---|
+| host only | 907 ms |
+| whole batch to the GPU | **53 ms**, 17x |
+| in chunks of 32768 | 36 ms, 25x |
+
+Chunking is for fitting, not for speed. Overlapping each chunk's upload with
+the previous chunk's solve was written, measured and removed: it lost to plain
+sequential chunking at every size tried, by 0.13x to 0.79x from pageable memory
+and still by 0.27x to 0.91x from pinned memory, where no staging copy is needed
+at all. The factorisation appears to synchronise internally, which would
+serialise the streams while still charging for them.
+
 ## Memory
 
 Twenty CG iterations on a 192³ complex volume, one RTX 4060 Laptop GPU:

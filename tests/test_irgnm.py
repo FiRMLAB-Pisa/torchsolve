@@ -306,3 +306,63 @@ def test_iterations_must_be_positive() -> None:
         gauss_newton(
             decay, decay(torch.ones(2).double()), torch.ones(2).double(), iterations=0
         )
+
+
+requires_cuda = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="needs a CUDA device"
+)
+
+
+def batched_problem(voxels: int, rows: int = 24, columns: int = 3):
+    """A batch of small independent least-squares problems, on the host."""
+    generator = torch.Generator().manual_seed(5)
+    jacobian = torch.randn(
+        voxels, rows, columns, generator=generator, dtype=torch.float32
+    )
+    target = torch.randn(voxels, rows, generator=generator, dtype=torch.float32)
+    penalty = torch.diff(torch.eye(columns, dtype=torch.float32), dim=0)
+    return LinearProblem(
+        normal=lambda v: v,
+        rhs=torch.zeros(voxels, columns),
+        alpha=0.2,
+        regularizers=[
+            Regularizer(1.0),
+            Regularizer(
+                0.5,
+                operator=lambda v: penalty @ v,
+                adjoint=lambda v: penalty.T @ v,
+            ),
+        ],
+        matrix=jacobian,
+        target=target,
+    )
+
+
+def test_streaming_is_not_used_for_a_small_batch() -> None:
+    problem = batched_problem(16)
+    assert LstsqSolver()._destination(problem.matrix) is None
+
+
+@requires_cuda
+def test_streamed_and_direct_agree() -> None:
+    problem = batched_problem(9000)
+    streamed = LstsqSolver(device="auto", chunk=1024)(problem)
+    on_host = LstsqSolver(device=None)(problem)
+    assert streamed.shape == on_host.shape
+    assert streamed.device.type == "cpu"
+    assert torch.allclose(streamed, on_host, atol=1e-4)
+
+
+@requires_cuda
+def test_a_ragged_final_chunk_is_handled() -> None:
+    problem = batched_problem(5000)
+    streamed = LstsqSolver(device="auto", chunk=1024)(problem)  # 4 full, one of 904
+    on_host = LstsqSolver(device=None)(problem)
+    assert torch.allclose(streamed, on_host, atol=1e-4)
+
+
+@requires_cuda
+def test_streaming_triggers_only_above_the_threshold() -> None:
+    solver = LstsqSolver(stream_above=1000)
+    assert solver._destination(batched_problem(2000).matrix) is not None
+    assert solver._destination(batched_problem(500).matrix) is None
