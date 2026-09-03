@@ -1,60 +1,88 @@
 # torchsolve
 
-Iterative solvers for inverse problems in PyTorch, written to spend as little
-memory per iteration as the arithmetic allows, and differentiable without
-storing one.
+Iteratively regularised Gauss-Newton for nonlinear inversion, and the inner
+solvers it needs -- written to spend as little memory per iteration as the
+arithmetic allows, and differentiable without storing one.
 
 [![Tests](https://github.com/FiRMLAB-Pisa/torchsolve/actions/workflows/test-ci.yml/badge.svg)](https://github.com/FiRMLAB-Pisa/torchsolve/actions/workflows/test-ci.yml)
 [![codecov](https://codecov.io/gh/FiRMLAB-Pisa/torchsolve/branch/main/graph/badge.svg)](https://codecov.io/gh/FiRMLAB-Pisa/torchsolve)
 [![PyPI](https://img.shields.io/pypi/v/torchsolve.svg)](https://pypi.org/project/torchsolve/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Conjugate gradient on the regularised normal equations,
+Fit a nonlinear model, or invert one, by linearising about the current estimate
+and solving the regularised linear problem that gives:
 
-$$\min_x \; \\|Ax - y\\|^2 + \\sum_k \\lambda_k \\|R_k x - c_k\\|^2 ,$$
+$$\big(DF^H DF + \alpha\big)(x - x_\text{ref}) = DF^H\big(y - F(x) + DF(x - x_\text{ref})\big),$$
 
-solved as $\\big(A^HA + \\sum_k \\lambda_k R_k^H R_k\\big)x = A^Hy + \\sum_k
-\\lambda_k R_k^H c_k$. The caller hands over $A^HA$ rather than $A$, because for
-a non-Cartesian acquisition that operator is a convolution costing far less
-than a transform pair, and because it is what a Toeplitz factorisation stands
-for.
+then decreasing $\alpha$ and repeating. The regularisation starts strong, which
+keeps the first steps from chasing a linearisation that is only locally true,
+and is relaxed geometrically as the estimate improves. **That schedule is the
+method** -- a Gauss-Newton step at fixed regularisation is something else.
+
+This follows BART's `irgnm2` in `src/iter/italgos.c`, which solves for
+$x - x_\text{ref}$ rather than for the update, at the cost of one extra
+derivative call, so the inner solve is an ordinary regularised least-squares
+problem that any solver can do.
 
 ![what it does](examples/figures/showcase.png)
 
-- **Any number of regularisation terms** — each with its own weight, its own
-  linear operator (identity by default, and then folded into a single scalar
-  rather than applied), and its own bias, which relocates what the term pulls
-  towards
+- **The inner solver is a seam, not a menu** — anything that maps a
+  `LinearProblem` to a step will do, so an ADMM or proximal solver belongs to
+  whoever needs it rather than to this package. Two are supplied: `CGSolver`
+  for a matrix-free problem, `LstsqSolver` for a small dense one
+- **One $\alpha$ governs every regularisation term**, which is what makes the
+  schedule a schedule. Terms carry weights *relative* to it, so a single scalar
+  still drives several penalties
+- **Any number of terms** — each with its own linear operator (identity by
+  default, and then folded into a scalar rather than applied) and its own bias,
+  which relocates what the term pulls towards
+- **Constraints are a change of variables, not a solver feature** — see below
+- **CG steps through negative curvature** — a compressed Toeplitz normal
+  carries eigenvalues just below zero, and a `pAp > 0` guard stops on them and
+  leaves the residual where it was. BART stops only on an exactly zero
+  curvature; so does this
 - **Preconditioning instead of density compensation** — the weighting belongs
   in the solver, where it changes only the path taken, rather than in the data,
-  where it changes which problem is being solved
-- **It steps through negative curvature** — a compressed Toeplitz normal
-  carries eigenvalues just below zero, and a `pAp > 0` guard stops on them and
-  leaves the residual where it was. BART's `conjgrad` stops only on an exactly
-  zero curvature; so does this, and it says so in the result rather than
-  failing quietly
+  where it changes which problem is solved
 - **Differentiable without unrolling** — a gradient reaching the solution
   reaches the right-hand side, and anything the operator closed over, through
-  one more solve. Memory is flat in the iteration count, so a solve deep enough
-  to converge costs a backward pass no larger than a shallow one
-- **Four volumes, whatever the iteration count** — the updates are in place and
-  the inner products are fused reductions
+  one more solve. Memory is flat in the iteration count
+
+## Constraints
+
+A bound and an equality are both changes of variable, so both are exact, cost
+nothing, and reach the solver as an ordinary unconstrained problem:
+
+```python
+# non-negative: fit the logarithm
+gauss_newton(lambda log_p: model(log_p.exp()), data, start)
+
+# w + f = 1: one free parameter fewer, and the sum holds by construction
+def two_pool(f):
+    return (1 - f) * fast(f) + f * slow(f)
+```
+
+What they change is the geometry the step is taken in, which is usually a help
+and occasionally a hindrance: $\theta^2$ has a vanishing derivative at zero, so
+an estimate driven to the bound stops moving; $e^\theta$ does not, but cannot
+reach zero. What genuinely needs more than this is a non-smooth penalty or a
+constraint coupling many parameters at once -- and that is what the solver seam
+is for, rather than something this package should grow.
 
 ## Memory
 
-Twenty iterations on a 192³ complex volume, one RTX 4060 Laptop GPU:
+Twenty CG iterations on a 192³ complex volume, one RTX 4060 Laptop GPU:
 
 | | peak | |
 |---|---|---|
 | `torchsolve` | 216 MiB | **4.0 volumes**, 166 ms |
 | the implementation it replaces | 432 MiB | 8.0 volumes, 254 ms |
 
-The difference is entirely in how the arithmetic is written. `torch.vdot` and a
-batched `einsum` take an inner product without materialising it;
+The difference is how the arithmetic is written. `torch.vdot` and a batched
+`einsum` take an inner product without materialising it;
 `(a.conj() * b).real.sum()` costs two whole volumes and `torch.linalg.vecdot`
 costs the same. The updates are `addcmul_` and `mul_`, not `x = x + a * p`.
-What is left is the four the algorithm needs — solution, residual, direction,
-and whatever the operator itself returns.
+What is left is the four the algorithm needs.
 
 ## Quick Start
 
@@ -64,31 +92,33 @@ pip install torchsolve
 
 ```python
 import torch
-from torchsolve import Regularizer, conjugate_gradient
+from torchsolve import CGSolver, LstsqSolver, Regularizer, gauss_newton
 
-# the plain solve: hand over the normal operator and A^H y
-result = conjugate_gradient(normal, rhs, max_iter=20, rtol=1e-6)
-result.solution, result.iterations, result.converged, result.definite
+# a nonlinear fit: the derivatives come from autograd unless you supply them
+found = gauss_newton(model, data, start, iterations=8, alpha=1.0, reduction=2.0)
+found.solution, found.residual_norms, found.alphas
 
-# weight the iteration rather than the data
-result = conjugate_gradient(normal, rhs, preconditioner=lambda r: r / diagonal)
+# a small dense problem, every voxel solved at once
+found = gauss_newton(model, data, start, solver=LstsqSolver(), batch_dims=1)
 
-# any number of terms: weight, operator (identity by default), bias
-result = conjugate_gradient(
-    normal,
-    rhs,
-    regularizers=[
-        Regularizer(1e-3),                                  # towards zero
-        Regularizer(2e-2, bias=previous_estimate),          # towards a prior
-        Regularizer(5e-2, operator=gradient, adjoint=divergence),  # smoothness
-    ],
+# a matrix-free one, and the regularisation the schedule scales
+found = gauss_newton(
+    model, data, start,
+    solver=CGSolver(max_iter=100, rtol=1e-4, preconditioner=weighting),
+    regularizers=[Regularizer(1.0), Regularizer(0.5, operator=gradient, adjoint=divergence)],
 )
 
-# a batch of independent systems, each taking its own step size
-result = conjugate_gradient(normal, rhs, batch_dim=0)
+# or hand it a solver this package has never heard of
+found = gauss_newton(model, data, start, solver=my_admm)
+```
 
-# learn something inside the operator, differentiating through the solve
-result = conjugate_gradient(normal, rhs, parameters=[weight])
+The linear solver is usable on its own:
+
+```python
+from torchsolve import conjugate_gradient
+
+result = conjugate_gradient(normal, rhs, regularizers=[...], preconditioner=...,
+                            batch_dim=0, parameters=[weight])
 result.solution.pow(2).sum().backward()
 ```
 

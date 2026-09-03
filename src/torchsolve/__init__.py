@@ -11,6 +11,14 @@ from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _distribution_version
 
 from ._cg import CGResult, Regularizer, conjugate_gradient
+from ._irgnm import (
+    GaussNewtonResult,
+    NonlinearOperator,
+    autodiff,
+    gauss_newton,
+)
+from ._problem import InnerSolver, LinearProblem
+from ._solvers import CGSolver, LstsqSolver
 
 try:
     __version__ = _distribution_version(__name__)
@@ -19,7 +27,15 @@ except PackageNotFoundError:  # a source tree that was never installed
 
 __all__ = [
     "CGResult",
+    "CGSolver",
+    "GaussNewtonResult",
+    "InnerSolver",
+    "LinearProblem",
+    "LstsqSolver",
+    "NonlinearOperator",
     "Regularizer",
     "__version__",
+    "autodiff",
     "conjugate_gradient",
+    "gauss_newton",
 ]
