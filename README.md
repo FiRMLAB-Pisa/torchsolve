@@ -67,9 +67,14 @@ found = gauss_newton(model, data, start, solver=LstsqSolver(), batch_dims=1)
 
 # a matrix-free one, and the regularisation the schedule scales
 found = gauss_newton(
-    model, data, start,
+    model,
+    data,
+    start,
     solver=CGSolver(max_iter=100, rtol=1e-4, preconditioner=weighting),
-    regularizers=[Regularizer(1.0), Regularizer(0.5, operator=gradient, adjoint=divergence)],
+    regularizers=[
+        Regularizer(1.0),
+        Regularizer(0.5, operator=gradient, adjoint=divergence),
+    ],
 )
 
 # or hand it a solver this package has never heard of
@@ -81,8 +86,14 @@ The linear solver is usable on its own:
 ```python
 from torchsolve import conjugate_gradient
 
-result = conjugate_gradient(normal, rhs, regularizers=[...], preconditioner=...,
-                            batch_dim=0, parameters=[weight])
+result = conjugate_gradient(
+    normal,
+    rhs,
+    regularizers=[...],
+    preconditioner=...,
+    batch_dim=0,
+    parameters=[weight],
+)
 result.solution.pow(2).sum().backward()
 ```
 
@@ -135,6 +146,7 @@ nothing, and reach the solver as an ordinary unconstrained problem:
 ```python
 # non-negative: fit the logarithm
 gauss_newton(lambda log_p: model(log_p.exp()), data, start)
+
 
 # w + f = 1: one free parameter fewer, and the sum holds by construction
 def two_pool(f):
