@@ -48,64 +48,6 @@ problem that any solver can do.
   reaches the right-hand side, and anything the operator closed over, through
   one more solve. Memory is flat in the iteration count
 
-## Constraints
-
-A bound and an equality are both changes of variable, so both are exact, cost
-nothing, and reach the solver as an ordinary unconstrained problem:
-
-```python
-# non-negative: fit the logarithm
-gauss_newton(lambda log_p: model(log_p.exp()), data, start)
-
-# w + f = 1: one free parameter fewer, and the sum holds by construction
-def two_pool(f):
-    return (1 - f) * fast(f) + f * slow(f)
-```
-
-What they change is the geometry the step is taken in, which is usually a help
-and occasionally a hindrance: $\theta^2$ has a vanishing derivative at zero, so
-an estimate driven to the bound stops moving; $e^\theta$ does not, but cannot
-reach zero. What genuinely needs more than this is a non-smooth penalty or a
-constraint coupling many parameters at once -- and that is what the solver seam
-is for, rather than something this package should grow.
-
-## Batched fits, and the GPU
-
-`LstsqSolver` sends a host-resident batch to the GPU when there is one and the
-batch is worth the transfer, and brings the answer back. Only the raw Jacobian
-crosses: the stacked system is assembled on the device, so the enlarged matrix
-is never held on the host.
-
-200k independent 32x4 problems, one RTX 4060 Laptop GPU:
-
-| | |
-|---|---|
-| host only | 907 ms |
-| whole batch to the GPU | **53 ms**, 17x |
-| in chunks of 32768 | 36 ms, 25x |
-
-Chunking is for fitting, not for speed. Overlapping each chunk's upload with
-the previous chunk's solve was written, measured and removed: it lost to plain
-sequential chunking at every size tried, by 0.13x to 0.79x from pageable memory
-and still by 0.27x to 0.91x from pinned memory, where no staging copy is needed
-at all. The factorisation appears to synchronise internally, which would
-serialise the streams while still charging for them.
-
-## Memory
-
-Twenty CG iterations on a 192³ complex volume, one RTX 4060 Laptop GPU:
-
-| | peak | |
-|---|---|---|
-| `torchsolve` | 216 MiB | **4.0 volumes**, 166 ms |
-| the implementation it replaces | 432 MiB | 8.0 volumes, 254 ms |
-
-The difference is how the arithmetic is written. `torch.vdot` and a batched
-`einsum` take an inner product without materialising it;
-`(a.conj() * b).real.sum()` costs two whole volumes and `torch.linalg.vecdot`
-costs the same. The updates are `addcmul_` and `mul_`, not `x = x + a * p`.
-What is left is the four the algorithm needs.
-
 ## Quick Start
 
 ```bash
@@ -146,12 +88,65 @@ result.solution.pow(2).sum().backward()
 
 ## Examples
 
-| | |
+The `.py` beside each notebook is the source — it runs as a script and lints
+with the rest of the package, and `scripts/build_examples.sh` is what turns it
+into the notebook.
+
+| | | |
+|---|---|---|
+| [`01-regularised_solve`](examples/01-regularised_solve.ipynb) | a shaped penalty and a bias, on a noisy staircase | [![Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/FiRMLAB-Pisa/torchsolve/blob/main/examples/01-regularised_solve.ipynb) |
+| [`02-preconditioning`](examples/02-preconditioning.ipynb) | a badly scaled operator, and what Jacobi buys without touching the data | [![Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/FiRMLAB-Pisa/torchsolve/blob/main/examples/02-preconditioning.ipynb) |
+| [`03-differentiable_weight`](examples/03-differentiable_weight.ipynb) | learning the regularisation weight, checked against a sweep | [![Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/FiRMLAB-Pisa/torchsolve/blob/main/examples/03-differentiable_weight.ipynb) |
+| [`04-irgnm`](examples/04-irgnm.ipynb) | the schedule against a fixed weight, the solver seam, and a batch of fits | [![Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/FiRMLAB-Pisa/torchsolve/blob/main/examples/04-irgnm.ipynb) |
+
+## What it costs
+
+Twenty CG iterations on a 192³ complex volume, and 200k independent 32×4
+problems, both on one RTX 4060 Laptop GPU.
+
+| | peak | |
+|---|---|---|
+| `torchsolve` CG | 216 MiB | **4.0 volumes**, 166 ms |
+| the implementation it replaces | 432 MiB | 8.0 volumes, 254 ms |
+
+| `LstsqSolver`, 200k problems | |
 |---|---|
-| [`preconditioning.py`](examples/preconditioning.py) | A badly scaled operator, and what Jacobi buys without touching the data |
-| [`regularised_solve.py`](examples/regularised_solve.py) | A shaped penalty and a bias, on a noisy staircase |
-| [`differentiable_weight.py`](examples/differentiable_weight.py) | Learning the regularisation weight, checked against a sweep |
-| [`make_showcase.py`](examples/make_showcase.py) | The figure above |
+| host only | 907 ms |
+| whole batch to the GPU | **53 ms**, 17× |
+| in chunks of 32768 | 36 ms, 25× |
+
+The memory difference is how the arithmetic is written: `torch.vdot` and a
+batched `einsum` take an inner product without materialising it, where
+`(a.conj() * b).real.sum()` costs two whole volumes and `torch.linalg.vecdot`
+costs the same; the updates are `addcmul_` and `mul_`, not `x = x + a * p`.
+What is left is the four vectors the algorithm needs.
+
+Only the raw Jacobian crosses to the device — the stacked system is assembled
+there, so the enlarged matrix is never held on the host. Chunking is for
+fitting a batch that does not fit, not for speed: overlapping each chunk's
+upload with the previous chunk's solve was written, measured and removed,
+because it lost to plain sequential chunking at every size tried.
+
+## Constraints
+
+A bound and an equality are both changes of variable, so both are exact, cost
+nothing, and reach the solver as an ordinary unconstrained problem:
+
+```python
+# non-negative: fit the logarithm
+gauss_newton(lambda log_p: model(log_p.exp()), data, start)
+
+# w + f = 1: one free parameter fewer, and the sum holds by construction
+def two_pool(f):
+    return (1 - f) * fast(f) + f * slow(f)
+```
+
+What they change is the geometry the step is taken in, which is usually a help
+and occasionally a hindrance: $\theta^2$ has a vanishing derivative at zero, so
+an estimate driven to the bound stops moving; $e^\theta$ does not, but cannot
+reach zero. What genuinely needs more than this is a non-smooth penalty or a
+constraint coupling many parameters at once — and that is what the solver seam
+is for, rather than something this package should grow.
 
 ## Related Works
 
@@ -178,6 +173,7 @@ result.solution.pow(2).sum().backward()
 pip install -e .[dev]
 bash scripts/format_and_lint.sh
 pytest -q
+bash scripts/build_examples.sh    # rebuild the notebooks and their figures
 ```
 
 The docstring examples run as part of the suite — they are the documentation,
