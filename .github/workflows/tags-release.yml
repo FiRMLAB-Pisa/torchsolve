@@ -58,11 +58,17 @@ jobs:
           inputs: |
             ./dist/*.tar.gz
             ./dist/*.whl
+      # A tag reaches this workflow either from a plain `git push --tags` or
+      # from a release cut in the web UI, which creates the release itself.
+      # Create one only when the tag has none, and let a re-run replace the
+      # assets it already uploaded.
       - env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
-          gh release create '${{ github.ref_name }}' \
-            --repo '${{ github.repository }}' \
-            --title '${{ github.ref_name }}' \
-            --generate-notes
-          gh release upload '${{ github.ref_name }}' dist/** --repo '${{ github.repository }}'
+          gh release view '${{ github.ref_name }}' --repo '${{ github.repository }}' >/dev/null 2>&1 ||
+            gh release create '${{ github.ref_name }}' \
+              --repo '${{ github.repository }}' \
+              --title '${{ github.ref_name }}' \
+              --generate-notes
+          gh release upload '${{ github.ref_name }}' dist/** \
+            --repo '${{ github.repository }}' --clobber
